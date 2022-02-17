@@ -1,0 +1,109 @@
+SELECT
+CONCAT(LEFT(ADRES. adr_nazwa,2),'-',CONVERT(VARCHAR,GETDATE(),12)) as OrderID,
+TOWAR.tw_Symbol as Item,
+FLAGI.flg_Text as Flag,
+TOWAR.tw_Uwagi as Name,
+DANEWLASNE.pwd_Liczba02 as 'PCS/CTN',
+DANEWLASNE.pwd_Tekst01 AS Packing,
+TOWAR.tw_Masa AS Weight,
+TOWAR.tw_Objetosc as VOL1PC,
+Stan.StanSuma as Stock,
+Stan.StanRezerwacji as Reserved,
+TOWAR.tw_stanMin as MinStock,
+PENDING.QTY as QPending,
+NULL as Lost24M, --- sumuj utracone w formacie x/y, gdzie X to liczba dokumentów utraconych a y suma ilosci z całości utraconych.
+LEFT(ADRES. adr_nazwa,2) as Supplier,
+DANEWLASNE.pwd_Tekst02 AS 'Check',
+--- zamów stanMin jeżeli większy od LastOrderQTY
+CASE 
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY>TOWAR.tw_stanMin  
+        THEN ROUND(LASTBUY.QTY/DANEWLASNE.pwd_Liczba02,0)
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY<=TOWAR.tw_stanMin
+        THEN ROUND(TOWAR.tw_stanMin/DANEWLASNE.pwd_Liczba02,0) 
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY IS NULL
+        THEN ROUND(TOWAR.tw_stanMin/DANEWLASNE.pwd_Liczba02,0) 
+        ELSE NULL END as OrderCTNS,
+CONCAT('=P',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol),'*E',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol)) as OrderPCS,
+CONCAT('=Q',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol),'*T',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol)) as OrderValue,
+LASTBUY.QTY as LQTY,
+LASTBUY.Price as LastBuy,
+LASTBUY.CUR as LCur,
+LASTBUY.OrderID as LOrderID,
+NULL as YRprice,
+NULL as YRem,
+NULL as Rem
+
+
+FROM 
+tw__towar TOWAR
+LEFT JOIN tw_CechaTw CECHA ON TOWAR.tw_ID=CECHA.cht_IdTowar ---AND cht_idCecha =2 --- cht_idCecha =2  = jest w katalogu
+LEFT JOIN kh__Kontrahent KONTRAHENT  on TOWAR.tw_IdPodstDostawca = KONTRAHENT.Kh_id  --- KONTRAHENT kh_Symbol
+LEFT JOIN adr__Ewid ADRES on ADRES.adr_IdObiektu= KONTRAHENT.kh_ID AND ADRES.adr_TypAdresu = 1 --- żeby nie potrajało rekordów na 3 adresy (firmy,korespondencyjny, dostawy 
+LEFT JOIN fl_Wartosc FLWartosc ON TOWAR.tw_Id=FLWartosc.flw_IdObiektu  AND flw_IdGrupyFlag =19 --- flw_IdGrupyFlag =19 to kategoria flag dla towarów i usług
+LEFT JOIN FL__flagi FLAGI ON FLAGI.flg_Id = FLWartosc.flw_IdFlagi
+LEFT JOIN pw_Dane DANEWLASNE WITH (NOLOCK) ON DANEWLASNE.pwd_IdObiektu = TOWAR.tw_Id AND DANEWLASNE.pwd_TypObiektu = -14
+LEFT JOIN --- tu dodaje tabele ze stanem towaru zebym nie musial grupowac calosci
+(
+   SELECT
+   TOWAR.tw_Symbol as StanSymbol,
+   SUM(STAN.st_Stan) as StanSuma,
+   SUM(STAN.st_StanRez) StanRezerwacji
+   FROM
+   tw__towar TOWAR 
+   LEFT JOIN tw_Stan STAN ON TOWAR.tw_id=st_TowId
+   GROUP BY
+   TOWAR.tw_Symbol
+) as STAN ON TOWAR.tw_Symbol = STAN.StanSymbol
+LEFT JOIN --- tu dodaję tabele z pendingiem wiszacym
+(
+   SELECT 
+   tw__towar.tw_Symbol as PendingItem, 
+   SUM(dok_pozycja.ob_Ilosc) as QTY
+   FROM 
+   ((dok__dokument INNER JOIN dok_pozycja ON dok__dokument.dok_Id = dok_pozycja.ob_DokHanId) 
+   INNER JOIN tw__towar ON dok_pozycja.ob_TowId = tw__towar.tw_Id) 
+   JOIN kh__Kontrahent ON dok_PlatnikId=kh_id
+   WHERE 
+   (dok__dokument.dok_KatId='16' AND dok_status = 6)  OR (dok__dokument.dok_KatId=15 AND dok_status = 6) --- shipments + orders
+GROUP BY
+tw_Symbol
+) as PENDING ON TOWAR.tw_symbol=PENDING.PendingItem
+LEFT JOIN --- tu dodaję LastBuy
+(
+   SELECT
+   Item,
+   Price,
+   QTY,
+   Date,
+   CUR,
+   OrderID
+   FROM
+   (
+      SELECT
+      TOW.tw_Symbol as 'Item', 
+      POZ.ob_CenaWaluta as 'Price',
+      POZ.ob_Ilosc as 'QTY',
+      DOK.dok_TerminRealizacji as 'Date',
+      DOK.dok_waluta as 'CUR',
+      POZ.ob_Opis as 'OrderID',
+      ROW_NUMBER() OVER(PARTITION BY tw_symbol ORDER BY tw_Symbol,dok_TerminRealizacji DESC)  as RowNum
+      FROM 
+     dok__dokument DOK INNER JOIN dok_pozycja POZ ON DOK.dok_Id = POZ.ob_DokHanId
+     INNER JOIN tw__towar TOW ON POZ.ob_TowId = TOW.tw_Id
+     JOIN kh__Kontrahent ON dok_PlatnikId=kh_id
+     WHERE 
+     (DOK.dok_katId='10' AND dok_status ='8')
+     OR
+     (DOK.dok_KatId='16' AND dok_status ='6')
+     OR
+     (DOK.dok_KatId='15' AND dok_status ='6')
+   ) as Tabela1
+   WHERE
+   RowNum =1 
+) AS LASTBUY on TOWAR.tw_Symbol=LASTBUY.Item
+
+WHERE
+CECHA.cht_idCecha =2  --- art. z cechą jest w katalogu
+
+ORDER BY
+TOWAR.tw_Symbol
