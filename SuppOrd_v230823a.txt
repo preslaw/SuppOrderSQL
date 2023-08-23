@@ -1,0 +1,231 @@
+---difference
+SELECT
+CONCAT(LEFT(ADRES. adr_nazwa,2),'-',CONVERT(VARCHAR,GETDATE(),12)) as OrderID,
+TOWAR.tw_Symbol as Item,
+FLAGI.flg_Text as Flag,
+TOWAR.tw_Uwagi as Name,
+DANEWLASNE.pwd_Liczba02 as 'PCS/CTN',
+DANEWLASNE.pwd_Tekst01 AS Packing,
+TOWAR.tw_Masa AS Weight,
+TOWAR.tw_Objetosc as VOL1PC,
+Stan.StanSuma as Stock,
+Stan.StanRezerwacji as Reserved,
+TOWAR.tw_stanMin as MinStock,
+PENDING.QTY as QPending,
+SOLD.SOLDCOUNT as Sold12M,  --- sumuje sprzeda¿ w formacie x/y, gdzie X to liczba faktur a y suma ilosci z faktur.
+LOST.LOSTCOUNT as Lost12M, --- sumuje utracone w formacie x/y, gdzie X to liczba dokumentów utraconych a y suma ilosci z ca³oœci utraconych.
+LEFT(ADRES. adr_nazwa,2) as Supplier,
+ALTSUPP.AltSupplier,
+DANEWLASNE.pwd_Tekst02 AS 'Check',
+--- zamów stanMin je¿eli wiêkszy od LastOrderQTY
+CASE 
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY>TOWAR.tw_stanMin  
+        THEN ROUND(LASTBUY.QTY/DANEWLASNE.pwd_Liczba02,0)
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY<=TOWAR.tw_stanMin
+        THEN ROUND(TOWAR.tw_stanMin/DANEWLASNE.pwd_Liczba02,0) 
+        WHEN ISNULL(PENDING.QTY,0)+Stan.StanSuma-Stan.StanRezerwacji<TOWAR.tw_stanMin AND LASTBUY.QTY IS NULL
+        THEN ROUND(TOWAR.tw_stanMin/DANEWLASNE.pwd_Liczba02,0) 
+        ELSE 0 END as OrderCTNS,
+CONCAT('=R',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol),'*E',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol)) as OrderPCS,
+CONCAT('=S',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol),'*V',1+ROW_NUMBER()OVER(ORDER BY TOWAR.tw_Symbol)) as OrderValue,
+LASTBUY.QTY as LQTY,
+LASTBUY.Price as 'LastBuy/Offer',
+LASTBUY.CUR as LCur,
+LASTBUY.OrderID as LOrderID,
+NULL as YRprice,
+NULL as YRem,
+NULL as Rem
+
+
+FROM 
+tw__towar TOWAR
+LEFT JOIN tw_CechaTw CECHA ON TOWAR.tw_ID=CECHA.cht_IdTowar ---AND cht_idCecha =2 --- cht_idCecha =2  = jest w katalogu
+LEFT JOIN kh__Kontrahent KONTRAHENT  on TOWAR.tw_IdPodstDostawca = KONTRAHENT.Kh_id  --- KONTRAHENT kh_Symbol
+LEFT JOIN adr__Ewid ADRES on ADRES.adr_IdObiektu= KONTRAHENT.kh_ID AND ADRES.adr_TypAdresu = 1 --- ¿eby nie potraja³o rekordów na 3 adresy (firmy,korespondencyjny, dostawy 
+LEFT JOIN fl_Wartosc FLWartosc ON TOWAR.tw_Id=FLWartosc.flw_IdObiektu  AND flw_IdGrupyFlag =19 --- flw_IdGrupyFlag =19 to kategoria flag dla towarów i us³ug
+LEFT JOIN FL__flagi FLAGI ON FLAGI.flg_Id = FLWartosc.flw_IdFlagi
+LEFT JOIN pw_Dane DANEWLASNE WITH (NOLOCK) ON DANEWLASNE.pwd_IdObiektu = TOWAR.tw_Id AND DANEWLASNE.pwd_TypObiektu = -14
+LEFT JOIN --- tu dodaje tabele ze stanem towaru zebym nie musial grupowac calosci
+(
+   SELECT
+   TOWAR.tw_Symbol as StanSymbol,
+   SUM(STAN.st_Stan) as StanSuma,
+   SUM(STAN.st_StanRez) StanRezerwacji
+   FROM
+   tw__towar TOWAR 
+   LEFT JOIN tw_Stan STAN ON TOWAR.tw_id=st_TowId
+   GROUP BY
+   TOWAR.tw_Symbol
+) as STAN ON TOWAR.tw_Symbol = STAN.StanSymbol
+LEFT JOIN --- tu dodajê tabele z pendingiem wiszacym
+(
+   SELECT 
+   tw__towar.tw_Symbol as PendingItem, 
+   SUM(dok_pozycja.ob_Ilosc) as QTY
+   FROM 
+   ((dok__dokument INNER JOIN dok_pozycja ON dok__dokument.dok_Id = dok_pozycja.ob_DokHanId) 
+   INNER JOIN tw__towar ON dok_pozycja.ob_TowId = tw__towar.tw_Id) 
+   JOIN kh__Kontrahent ON dok_PlatnikId=kh_id
+   WHERE 
+   (dok__dokument.dok_KatId='16' AND dok_status = 6)  OR (dok__dokument.dok_KatId=15 AND dok_status = 6) --- shipments + orders
+GROUP BY
+tw_Symbol
+) as PENDING ON TOWAR.tw_symbol=PENDING.PendingItem
+LEFT JOIN --- tu dodajê LastBuy
+(
+   SELECT
+   Item,
+   Price,
+   QTY,
+   Date,
+   CUR,
+   OrderID
+   FROM
+   (
+      SELECT
+      TOW.tw_Symbol as 'Item', 
+      POZ.ob_CenaWaluta as 'Price',
+      POZ.ob_Ilosc as 'QTY',
+      DOK.dok_TerminRealizacji as 'Date',
+      DOK.dok_waluta as 'CUR',
+      POZ.ob_Opis as 'OrderID',
+      ROW_NUMBER() OVER(PARTITION BY tw_symbol ORDER BY tw_Symbol,dok_TerminRealizacji DESC)  as RowNum
+      FROM 
+     dok__dokument DOK INNER JOIN dok_pozycja POZ ON DOK.dok_Id = POZ.ob_DokHanId
+     INNER JOIN tw__towar TOW ON POZ.ob_TowId = TOW.tw_Id
+     JOIN kh__Kontrahent ON dok_PlatnikId=kh_id
+     WHERE 
+     DOK.dok_Typ = 15 --- wszystkie zamówienia, wczeœniej by³o z rozbiciem na dokumenty ze statusem shipments, orders, magazyn, oferta, ale takie filtrowanie jest niepotrzebne
+     --- (DOK.dok_katId='10' AND dok_status ='8')
+     ---OR
+     ---(DOK.dok_KatId='16' AND dok_status ='6')
+     ---OR
+     ---(DOK.dok_KatId='15' AND dok_status ='6')
+     ---OR                                                                               --- zeby tez pokazywa³o oferty
+     ---(DOK.dok_KatId='12' AND dok_status IN ('6','7','8')) --- zeby tez pokazywa³o oferty
+   ) as Tabela1
+   WHERE
+   RowNum =1 
+) AS LASTBUY on TOWAR.tw_Symbol=LASTBUY.Item
+
+
+--- dodaje alternatywnego dostawcê
+LEFT JOIN
+(
+   SELECT
+
+   TOWAR.tw_Symbol as Item,
+   LEFT(ADRES. adr_nazwa,2) as AltSupplier
+
+   FROM
+
+   tw__towar TOWAR
+   LEFT JOIN tw_CechaTw CECHA ON TOWAR.tw_ID=CECHA.cht_IdTowar AND cht_idCecha =2 --- cht_idCecha =2  = jest w katalogu
+   LEFT JOIN kh__Kontrahent KONTRAHENT  on TOWAR.tw_IdPodstDostawca = KONTRAHENT.Kh_id  --- KONTRAHENT kh_Symbol
+   LEFT JOIN adr__Ewid ADRES on ADRES.adr_IdObiektu=TOWAR.tw_idProducenta AND ADRES.adr_TypAdresu = 1 
+
+   WHERE
+   CECHA.cht_idCecha =2  --- art. z cech¹ jest w katalogu
+   AND
+   tw_Zablokowany = 0 --- tylko aktywne artyku³y
+
+) as ALTSUPP on TOWAR.tw_symbol = ALTSUPP.Item
+
+---dodajê utracone LOST12M
+LEFT JOIN
+(
+    SELECT 
+    LOST.Item,
+    CONCAT (COUNT(LOST.Item),'\',LTRIM(STR(SUM(LOST.Max)))) as LOSTCOUNT
+    FROM
+    (
+    SELECT
+    TOW.tw_Symbol as Item,
+    ---POZ.ob_Ilosc,
+    MAX(POZ.ob_Ilosc) as Max,
+    ---DOK.dok_DataWyst,  --- data wystawienia dokumentu utracone
+    ---DOK.dok_NrPelny, --- numer dokumentu utracone
+    ADR.adr_Nazwa AS COMPANY
+    ---UZY.uz_Nazwisko  - nazwisko opiekuna 
+    ---DOK2.dok_NrPelnyOryg as 'Shipment' --- nr dokumentu shipment
+    ---LastPZ.DATE as 'LastPZ Date' - data ostatniego PZ towaru
+   FROM 
+    dok__dokument DOK
+    ---utracone
+    JOIN
+    dok_Pozycja POZ ON POZ.ob_DokHanId = DOK.dok_Id AND (DOK.dok_KatId='17' AND DOK.dok_status = 8)
+    JOIN 
+    tw__Towar TOW ON TOW.tw_Id = POZ.ob_TowId
+
+    JOIN 
+    adr__Ewid ADR ON ADR.adr_IdObiektu = DOK.dok_PlatnikId
+
+    JOIN
+    kh__Kontrahent KON ON KON.kh_Id = ADR.adr_IdObiektu
+
+    LEFT JOIN 
+    pd_Uzytkownik UZY ON UZY.uz_Id = KON.kh_IdOpiekun
+
+    WHERE 
+    ADR.adr_TypAdresu = 1   --- zeby nie potraja³o rekordów przy do³¹czeniu ADR, potraja  pewnie dlatego ze s¹ 3 typy adresu i do ka¿dego rekordu tworzy 3 rekordy z kazdym rodzajem typu adresu
+    ---  ustawiam na sztywno zakres 2 lata wstecz od daty bie¿¹cej dla utraconych
+    AND DOK.dok_DataWyst >= (GETDATE()-365) 
+
+    GROUP BY
+    TOW.tw_Symbol, ADR.adr_Nazwa
+
+    ) as LOST
+
+    GROUP BY
+    LOST.Item
+
+
+) AS LOST ON TOWAR.tw_Symbol = LOST.Item
+
+--- dodajê sprzedane SOLD12M
+LEFT JOIN(
+SELECT 
+
+SOLD.Item,
+CONCAT (SOLD.INVNO,'\',LTRIM(STR(SUM(SOLD.Suma)))) AS SOLDCOUNT
+
+FROM
+(
+SELECT
+TOW.tw_Symbol as Item,
+SUM(POZ.ob_Ilosc) as Suma,
+COUNT(DOK.dok_NrPelny)  as INVNO
+
+FROM 
+dok__dokument DOK
+
+---utracone
+JOIN
+dok_Pozycja POZ ON POZ.ob_DokHanId = DOK.dok_Id  AND DOK.dok_typ=16 AND DOK.dok_Status=8  AND DOK.dok_katID<>17      --- zamówienia zrealizowane bez utraconych (DOK.dok_katID<>17 )
+---dok_Pozycja POZ ON POZ.ob_DokHanId = DOK.dok_Id  AND DOK.dok_typ=2 --- DOK.dok_typ=16 AND DOK.dok_Status=8  warunek na zamówienia zrealizowane, faktury: AND DOK.dok_typ=2, ale nie pokazuje faktur zbiorczych z DROPU!
+
+JOIN 
+tw__Towar TOW ON TOW.tw_Id = POZ.ob_TowId
+
+WHERE 
+DOK.dok_DataWyst  >(GETDATE()-365)
+
+
+GROUP BY
+TOW.tw_Symbol
+) as SOLD
+
+GROUP BY
+SOLD.Item,SOLD.INVNO
+
+) AS SOLD  ON TOWAR.tw_Symbol = SOLD.Item
+
+
+
+WHERE
+CECHA.cht_idCecha =2  --- art. z cech¹ jest w katalogu
+AND
+tw_Zablokowany = 0 --- tylko aktywne artyku³y
+
+ORDER BY
+TOWAR.tw_Symbol
